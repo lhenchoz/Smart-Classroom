@@ -1,0 +1,704 @@
+---
+title: "PRR Gruppenarbeit k-Fertig"
+author: "Noah Recher, Logan Henchoz, Kevin Wartmann"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    toc_float: true
+    theme: simplex
+    highlight: haddock
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+&nbsp;   
+&nbsp;
+
+# Datenbeschaffung {.tabset}
+## Datenbezug
+## Datenbeschreibung
+## Datenimport
+### Pakete laden
+
+```{r warning=FALSE}
+packages <- c(
+  "tidyverse", "plyr", "httr", "jsonlite", "timetk", "dplyr", "tidyr", "readxl", "lubridate"
+)
+easypackages::libraries(packages)
+```
+
+### Daten laden
+
+#### Import über REST-API
+```{r}
+# search <- function(search_params = NULL, start_date = NULL, end_date = NULL) {
+#   url <- "http://46.231.204.49:80/search"
+# 
+#   query_params <- search_params
+# 
+#   if (!is.null(start_date) && !is.null(end_date)) {
+#     query_params$start_date <- start_date
+#     query_params$end_date <- end_date
+#   }
+# 
+#   response <- GET(url, query = query_params)
+# 
+#   if (status_code(response) == 200) {
+#     data <- content(response, "text")
+#     json_obj <- fromJSON(data)
+#     return(json_obj)
+#   } else {
+#     print("Error retrieving data!")
+#   }
+# }
+# 
+# # Funktion aufrufen
+# df <- search(
+#   start_date = "2023-04-26",
+#   end_date = "2023-06-04"
+# )
+```
+
+#### Import über CSV-Datei
+```{r}
+df <- read.csv("cde2.csv", sep=",")
+```
+
+## Datenbereinigung
+
+### Daten umstrukturieren
+
+```{r message=FALSE, warning=FALSE}
+# Messwerte von einer Spalte auf eine Zeile transformieren
+df <- df %>% 
+  pivot_wider(names_from=c(sensor_id,einheit_id),values_from = wert) %>%
+  group_by(zeitstempel) %>%
+  summarise_each(funs(mean=mean(., na.rm = TRUE)))
+```
+
+### Benötigte Spalten selektieren und umbenennen
+
+```{r}
+# Benötigte Spalten selektieren
+df <- df %>% select(c("zeitstempel", "experiment_id_mean","2_3_mean", "2_4_mean", "2_1_mean", "1_2_mean", "1_4_mean", "1_1_mean"))
+
+# Spalten umbenennen
+colnames(df) <- c("date_time", "experiment", "mc_distance", "mc_humidity", "mc_temperature", "pi_co2", "pi_humidity", "pi_temperature")
+```
+
+&nbsp;   
+&nbsp;
+
+### Datentypen anpassen
+
+```{r}
+str(df)
+```
+```{r}
+# Spalten korrekte Datentypen zuordnen
+df$date_time <- df$date_time <- ymd_hms(df$date_time)
+df <- df %>% mutate_at(c("experiment", "mc_humidity", "mc_temperature", "pi_humidity", "pi_temperature"), as.integer)
+
+# Kategorien für co2-Werte erstellen
+df$co2_grouped <- cut(df$pi_co2, breaks = seq(0,2000, by=50))
+
+# Kategorien für Feuchtigkeitswerte erstellen
+df$humidity_grouped <- cut(df$pi_humidity, breaks = seq(0,100, by=5))
+```
+
+### Externe Datenquelle anfügen
+
+```{r}
+# Externe Daten importieren
+df_extern <- read_excel("externe_datenquelle.xlsx")
+
+# Konvertiere in gleiches Zeitformat
+df_extern$time <- ymd_hms(df_extern$time)
+
+# Runde die Zeitstempel auf die nächste Stunde auf oder ab, basierend auf den Minuten
+df$rounded_hour <- ifelse(minute(df$date_time) > 30, ceiling_date(df$date_time, unit = "hour"), floor_date(df$date_time, unit = "hour"))
+
+# Konvertiere die Spalte "rounded_hour" in den gleichen Datentyp wie die Spalte "time" in df_extern
+df$rounded_hour <- as_datetime(df$rounded_hour)
+
+# Aussentemperatur anhand der Zeit einfügen
+df <- left_join(df, df_extern %>% select(time, temp), by = c("rounded_hour" = "time")) %>% select(-rounded_hour)
+```
+
+### Zeitintervall definieren
+
+```{r}
+df <- df %>%
+  filter(date_time >= as.Date("2023-04-26 00:00:00") & date_time <= as.Date("2023-06-04 00:00:00"))
+```
+
+
+&nbsp;   
+&nbsp;
+
+### Fenster Status bestimmen
+
+```{r}
+df$mc_distance <- df$mc_distance > 10
+```
+
+&nbsp;   
+&nbsp;
+
+### Daten nach Experiment aufteilen
+
+```{r}
+df_exp_1 <- df %>% filter(experiment == 1) %>% select(!experiment)
+df_exp_2 <- df %>% filter(experiment == 2) %>% select(!experiment)
+```
+
+&nbsp;   
+&nbsp;
+
+### Ausreisser untersuchen
+
+```{r}
+df %>% 
+  gather(key = "variable", value = "value", c("mc_humidity", "mc_temperature", "pi_co2", "pi_humidity", "pi_temperature")) %>% 
+  ggplot(aes(x = value, fill = variable)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~ variable, scales = "free") +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+  labs(title = 'Numerische Variablen als Boxplot dargestellt', 
+       subtitle = paste('Anzahl Observationen:', nrow(df)), 
+       x = 'Wert')
+```
+
+```{r}
+df %>%                                    
+  arrange(desc(mc_temperature)) %>% 
+  slice(1:3)
+```
+
+Bei der Temperatur Messung vom Micro-Controller gab es zwei Temperatur Messwerte von über 1000 Grad. Wir löschen diese Einträge.
+
+```{r}
+df <- df %>% subset(mc_temperature < 1000)
+```
+
+&nbsp;   
+&nbsp;
+
+# Explorative Datenanalyse
+
+## Summarische Statistik
+```{r}
+summary(df)
+```
+
+## Verteilungen visualisieren
+
+```{r}
+df %>% 
+  pivot_longer(names_to = "variable", values_to = "value", cols = c("mc_humidity", "mc_temperature", "pi_co2", "pi_humidity", "pi_temperature")) %>%
+  ggplot(aes(value, fill = variable)) +
+  geom_histogram(bins = 20, color = "black", show.legend = FALSE ) +
+  facet_wrap(~variable, scales = "free")
+```
+## Zeitreihen visualisieren
+
+```{r}
+# Erstellen eines Zeitreihenobjekts für jeden Wert
+CO2 <- ts(df$pi_co2, start = min(df$date_time), frequency = 2)
+Humidity <- ts(df$pi_humidity, start = min(df$date_time), frequency = 2)
+Temperature <- ts(df$pi_temperature, start = min(df$date_time), frequency = 2)
+
+# Zusammenfügen der Zeitreihen in eine Matrix
+ts_matrix <- cbind(CO2, Humidity, Temperature)
+
+# Visualisierung der Zeitreihen
+plot(ts_matrix, main = "Zeitreihen", xlab = "Zeitstempel", ylab = "Wert")
+
+ggsave("./Bilder/Abbildung_1.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+&nbsp;   
+&nbsp;
+
+# Fragestellungen {.tabset}
+## 1. Fragestellung
+
+### Lüftvorgänge filtern
+
+```{r}
+# Bestimmen, wann der Fenster Status auf offen ändert und denn Lüftvorgang startet
+oeffnungs_index <- which(diff(df$mc_distance) == TRUE) + 1
+oeffnungs_zeitpunkt <- df$date_time[oeffnungs_index]
+
+# Bestimmen, wann der Fenster Status auf geschlossen ändert und der Lüftvorgang beendet wird
+schliessungs_index <- which(diff(df$mc_distance) == -1) + 1
+schliessungs_zeitpunkt <- df$date_time[schliessungs_index]
+
+# Neuen Datensatz zur Befüllung initialisieren
+df_lueftintervalle <- data.frame()
+
+# In einer Schleife die Lüftungsintervalle herausfiltern
+for (i in 1:length(oeffnungs_index)) {
+  
+  # Zeitpunkt setzen, wann das Fenster geöffnet wurde
+  fenster_oeffnung <- oeffnungs_zeitpunkt[i]
+  
+  # Zeitintervall setzen abhängig davon wie lange die Lüftung dauert oder maximal 10 Minuten
+  end_zeitpunkt <-  min(schliessungs_zeitpunkt[i], oeffnungs_zeitpunkt[i] + 600)
+  
+  # Relevante Daten auslesen und modifizieren
+  lueftintervall <- df %>%
+    filter(df$date_time >= fenster_oeffnung & df$date_time <= end_zeitpunkt) %>%  # Observationen des Lüftungsintervalls aggregieren
+    mutate(lueftung_id = i) %>%  # Observationen dem Lüftintervall zuordnen
+    mutate(initial_co2_grouped = first(co2_grouped),  # Start co2-Wert anfügen
+           initial_humidity_grouped = first(humidity_grouped),  # Start Humidity anfügen
+           seconds_past = as.numeric(difftime(date_time, fenster_oeffnung, units = "secs")))  # Sekunden seit Beginn des Lüftungsvorgangs berechnen
+  
+  df_lueftintervalle <- rbind(df_lueftintervalle, lueftintervall)  # Intervall zum DataFrame hinzufügen
+}
+
+print(df_lueftintervalle)
+```
+
+### Ungültige Lüftvorgänge entfernen
+
+In Lüftdurchgang Nummer 66 waren mehr als eine Person im Zimmer weswegen dieser nicht repräsentativ ist und wir ihn entfernen.
+
+```{r}
+df_lueftintervalle <- df_lueftintervalle %>% filter(lueftung_id != 66)
+```
+
+### Lüftvorgänge visualisieren
+
+```{r warning=FALSE}
+df_lueftintervalle %>%
+  ggplot(aes(x = seconds_past, y = pi_co2, group = lueftung_id)) +
+  geom_line(size = 1, color = "#598392") +
+  xlim(c(0,300)) +
+  facet_wrap(~ experiment, labeller = labeller(experiment = c("1" = "Lüften ohne Durchzug", "2" = "Lüften mit Durchzug"))) +
+  labs(title = "Vergleich der CO2 Konzentration bei Lüften mit und ohne Durchzug", x = "Zeit in Sekunden", y = "CO2 in ppm")
+
+ggsave("./Bilder/Abbildung_2.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+```{r warning=FALSE}
+df_lueftintervalle %>%
+  ggplot(aes(x = seconds_past, y = pi_humidity, group = lueftung_id)) +
+  geom_line(size = 1, color = "#598392") +
+  xlim(c(0,300)) +
+  facet_wrap(~ experiment, labeller = labeller(experiment = c("1" = "Lüften ohne Durchzug", "2" = "Lüften mit Durchzug"))) +
+  labs(title = "Vergleich der Luftfeutchtigkeit bei Lüften mit und ohne Durchzug", x = "Zeit in Sekunden", y = "Luftfeuchtigkeit in Prozent")
+
+ggsave("./Bilder/Abbildung_3.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+### Lüftdurchgänge gruppieren
+Nun komprimieren wir die Daten etwas um die Grafik überschaubarer zu machen. Hierfür gruppieren wir nicht mehr nach lueftungs_id sondern nach initial_co2_grouped also dem initialen co2-Wert. Ausserdem berechnen wir den co2-Durchschnitt pro Minute.
+
+```{r}
+# Gruppierung für CO2
+df_lueftintervalle_grouped_co2 <- df_lueftintervalle %>%
+  group_by(experiment, lueftung_id, initial_co2_grouped) %>%  # Daten Nach Experiment und Lüftintervall gruppieren
+  summarise_by_time(date_time, .by = "minute", .type = "floor", co2_mean = mean(pi_co2)) %>%  # Durchschnittlicher co2-Wert pro Minute berechnen
+  dplyr::mutate(minutes_past = as.numeric(difftime(date_time, first(date_time), units = "mins"))) %>%  # Minuten seid Beginn der Lüftung berechnen 
+  group_by(experiment, initial_co2_grouped, minutes_past) %>%  # Nach Experiment und Initalem co2-Wert und Minute gruppieren
+  dplyr::summarise(co2_mean = mean(co2_mean), .groups="keep")  # Durchschnittlichen co2-Wert berechnen
+
+# Gruppierung für Luftfeuchtigkeit
+df_lueftintervalle_grouped_humidity <- df_lueftintervalle %>%
+  group_by(experiment, lueftung_id, initial_humidity_grouped) %>%  # Daten Nach Experiment und Lüftintervall gruppieren
+  summarise_by_time(date_time, .by = "minute", .type = "floor", humidity_mean = mean(pi_humidity)) %>%  # Durchschnittlicher co2-Wert pro Minute berechnen
+  dplyr::mutate(minutes_past = as.numeric(difftime(date_time, first(date_time), units = "mins"))) %>%  # Minuten seid Beginn der Lüftung berechnen 
+  group_by(experiment, initial_humidity_grouped, minutes_past) %>%  # Nach Experiment und Initalem co2-Wert und Minute gruppieren
+  dplyr::summarise(humidity_mean = mean(humidity_mean), .groups="keep")  # Durchschnittlichen co2-Wert berechnen
+```
+
+### Gruppierte Lüftdurchgänge visualisieren
+
+```{r warning=FALSE}
+df_lueftintervalle_grouped_co2 %>% 
+  ggplot(aes(x = minutes_past, y = co2_mean, group = initial_co2_grouped, color = initial_co2_grouped)) +
+  geom_line(size = 1, show.legend = FALSE) +
+  xlim(c(0,5)) +
+  facet_wrap(~ experiment, labeller = labeller(experiment = c("1" = "Lüften ohne Durchzug", "2" = "Lüften mit Durchzug"))) +
+  labs(title = "Vergleich der CO2 Konzentration bei Lüften mit und ohne Durchzug", subtitle = "Gruppiert nach co2-Wert pro Minute und Anfangs co2-Wert", x = "Zeit in Minuten", y = "CO2 in ppm")
+
+ggsave("./Bilder/Abbildung_4.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+```{r warning=FALSE}
+df_lueftintervalle_grouped_humidity %>% 
+  ggplot(aes(x = minutes_past, y = humidity_mean, group = initial_humidity_grouped, color = initial_humidity_grouped)) +
+  geom_line(size = 1, show.legend = FALSE) +
+  xlim(c(0,5)) +
+  facet_wrap(~ experiment, labeller = labeller(experiment = c("1" = "Lüften ohne Durchzug", "2" = "Lüften mit Durchzug"))) +
+  labs(title = "Vergleich der Luftfeuchtigkeit bei Lüften mit und ohne Durchzug", subtitle = "Gruppiert nach Luftfeuchtigkeit pro Minute und Start Luftfeuchtigkeit", x = "Zeit in Minuten", y = "Luftfeuchtigkeit in Prozent")
+
+ggsave("./Bilder/Abbildung_5.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+## 2. Fragestellung
+
+Da wir in der ersten Fragestellung zeigen konnten, dass Lüften mit Durchzug effizienter ist, werden wir uns für diese Fragestellung auf Lüftungen aus Experiment 2 also Lüften mit Durchzug beschränken.
+
+Um ein repräsentatives Resultat zu erzielen, entfernen wir Lüftdurchgänge, bei welchen der co2-Wert Innen beim öffnen des Fensters besser war als draussen. Also alle Durchgänge, bei welchen der Start co2-Wert tiefer war als der End co2-Wert. Ausserdem wählen wir nur Durchgänge, welche länger als 3 Minuten dauerten.
+
+```{r}
+filtered_intervals <- df_lueftintervalle %>% 
+  group_by(lueftung_id) %>%
+  filter(first(pi_co2) >= last(pi_co2) & first(pi_co2) >= 500 & last(seconds_past >= 180) & experiment == 2) %>%
+  ungroup()
+```
+
+Wir teilen ausserdem in verschiedene Klassen ein, bezüglich dem Unterschied der Innen- und Aussentemperatur.
+
+```{r}
+filtered_intervals <- filtered_intervals %>% 
+  group_by(lueftung_id) %>% 
+  mutate(temp_diff_group = cut(abs(pi_temperature - temp), breaks = seq(0,20, by=2)))
+```
+
+Nun erstellen wir zwei Funktionen, welche sowohl für die Temperatur und das CO2 die optimale Lüftungsdauer annähern.
+
+find_opt_co2:
+
+Um die optimale Lüftungsdauer für den CO2-Wert zu finden, wollten wir den Punkt annähern, bei welchem der Raum den CO2-Wert von Aussen angenommen hat, sich dieser also nur noch leicht bis gar nicht verändert. Hierfür haben wir den minimalen CO2-Wert gesucht, und im Intervall von minimaler CO2-Wert +- 10 den ersten Zeitpunkt gewählt, bei welchem sich der Messwert im Intervall befindet.
+
+find_opt_temperature:
+
+Um die optimale Lüftungsdauer für die Temperatur anzunähern, haben wir den letzten Zeitpunkt gewählt, bei welchem die Temperatur nur um ein Grad von der Innentemperatur als der Anfangstemperatur der Lüftung abweicht.
+
+```{r}
+find_opt_co2 <- function(data, lueftungszeit) {
+  min_value <- min(data)  # Minimalen Messwert finden
+  target_range <- c(min_value - 10, min_value + 10)  # Intervall definieren
+  
+  # Index des ersten Messwerts im Intervall finden
+  nearest_index <- min(which(data >= target_range[1] & data <= target_range[2]))
+  
+  # Den Wert anhand des Index zurückgeben
+  nearest_value <- lueftungszeit[nearest_index]
+  
+  return(nearest_value)
+}
+
+find_opt_temperature <- function(temperatur, lueftungszeit) {
+  
+  # Letzter Wert suchen, bei dem die Temperaturdifferenz kleiner als 2 ist
+  start_temperatur <- temperatur[1]  # Starttemperatur ist der erste Wert
+  last_temperatur_index <- max(which(abs(start_temperatur - temperatur) <= 1))
+  letzter_wert_temperatur <- lueftungszeit[last_temperatur_index]
+  
+  return(letzter_wert_temperatur)
+}
+
+# Gruppieren nach Lüftungs-ID und Anwendung der Funktion auf jedes Lüftungsintervall
+ergebnis <- filtered_intervals %>%
+  filter(experiment == 2) %>% 
+  group_by(lueftung_id) %>%
+  dplyr::summarise(t_co2_konstant = find_opt_co2(pi_co2, seconds_past), t_temperatur_konstant = find_opt_temperature(pi_temperature, seconds_past), temp_diff_group = first(temp_diff_group))
+
+print(ergebnis)
+```
+
+
+Hier die Resultate unserer Funktionen, welche die optimale Lüftungsdauer eruieren.
+
+
+```{r}
+filtered_intervals %>% filter(experiment == 2) %>% 
+  ggplot(aes(x = seconds_past, y = pi_co2, group = lueftung_id)) +
+  geom_line(size = 1, color = "#598392") +
+  geom_vline(data = ergebnis, aes(xintercept = t_co2_konstant), color = "red", linetype = "dashed", size = 1) +
+  facet_wrap(~ lueftung_id, scales = "free") +
+  theme_minimal() +
+  labs(title = "Optimale Lüftungsdauer aller Lüftdurchgänge nach CO2", subtitle = "Rote Linie markiert die optimale Lüftungsdauer", x = "Zeit in Sekunden", y = "CO2 in ppm") +
+  theme(plot.title = element_text(size = 16),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        strip.text = element_text(size = 12))
+
+ggsave("./Bilder/Optimum_Lüftungsdauer_CO2.png", width = 12, height = 8, dpi = 300, bg = "white")
+
+filtered_intervals %>% filter(experiment == 2) %>% 
+  ggplot(aes(x = seconds_past, y = pi_temperature, group = lueftung_id)) +
+  geom_line(size = 1, color = "#598392") +
+  geom_vline(data = ergebnis, aes(xintercept = t_temperatur_konstant), color = "red", linetype = "dashed", size = 1) +
+  facet_wrap(~ lueftung_id, scales = "free") +
+  theme_minimal() +
+  labs(title = "Optimale Lüftungsdauer aller Lüftdurchgänge nach Temperatur", subtitle = "Rote Linie markiert die optimale Lüftungsdauer", x = "Zeit in Sekunden", y = "Temperatur in Grad Celsius") +
+  theme(plot.title = element_text(size = 16),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        strip.text = element_text(size = 12))
+
+ggsave("./Bilder/Optimum_Lüftungsdauer_Temperatur.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+Wir berechnen nun die optimale Lüftungsdauer, wenn man die Energieeffizienz nicht berücksichtigt.
+
+```{r}
+print(paste("Die optimale Lüftungsdauer nur auf CO2 bezogen ist: ", round(mean(ergebnis$t_co2_konstant) / 60, 2), " Minuten"))
+```
+
+Wir beziehen nun noch den Faktor Energieeffizienz ein, indem wir denn Schnitt zwischen der optimalen Lüftungszeit für das CO2 und der Temperatur nehmen. Sollte die optimale Lüftungszeit der Temperatur nach der des CO2 liegen, wird die optimale Lüftungsdauer des CO2 verwendet, da die Tempertatur ja immernoch auf Raumtempertatur ist.
+
+```{r}
+df_energieeffizient <- ergebnis %>%
+  group_by(temp_diff_group) %>% 
+  mutate(t_energieeffizient = ifelse(t_co2_konstant <= t_temperatur_konstant, t_co2_konstant, (t_co2_konstant + t_temperatur_konstant)/2))
+
+print(paste("Die optimale Lüftungsdauer inkl. Energieeffizienz ist: ", round(mean(df_energieeffizient$t_energieeffizient) / 60, 2), " Minuten"))
+```
+```{r}
+df_energieeffizient_grouped <- df_energieeffizient %>% group_by(temp_diff_group) %>% dplyr::summarise(mean_per_group = mean(t_energieeffizient), n = n())
+```
+
+```{r}
+df_energieeffizient_grouped %>%
+  ggplot(aes(x = temp_diff_group, y = mean_per_group)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Temperaturdifferenz in Grad Celsius",
+       y = "Durchschnittliche optimale Lüftungsdauer") +
+  ggtitle("Durchschnittliche optimale Lüftungsdauer gruppiert nach Temperaturdifferenz") +
+  theme_minimal() +
+  geom_text(aes(label = round(mean_per_group, 0)), vjust = -0.5)
+
+ggsave("./Bilder/Abbildung_6.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+```{r}
+filtered_intervals %>% 
+  select(lueftung_id, pi_co2, pi_humidity, pi_temperature, temp, seconds_past) %>% 
+  cor(method = "pearson") %>%
+  reshape2::melt() %>%
+  ggplot(aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), size = 6) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    text = element_text(size = 10)
+  ) +
+  labs(
+    title = "Korrelationsmatrix der numerischen Variablen nach Pearson",
+    fill = "Wert"
+  )
+
+ggsave("./Bilder/Abbildung_7.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+```{r}
+filtered_intervals_mean_per_min <- filtered_intervals %>%
+  group_by(lueftung_id) %>%  # Daten Nach Experiment und Lüftintervall gruppieren
+  summarise_by_time(date_time, .by = "minute", .type = "floor", co2_mean = mean(pi_co2)) %>%  # Durchschnittlicher co2-Wert pro Minute berechnen
+  dplyr::mutate(minutes_past = as.numeric(difftime(date_time, first(date_time), units = "mins"))) %>% 
+  group_by(minutes_past) %>% 
+  dplyr::summarise(co2_mean = mean(co2_mean))
+
+filtered_intervals_mean_per_min %>% ggplot(aes(x=minutes_past,y=co2_mean)) + geom_line()
+
+ggsave("./Bilder/Abbildung_8.png", width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+## 3. Fragestellung
+
+Sehen wir eine Änderung der Luftqualität, sprich in der Luftfeuchtigkeit oder beim CO2-Wert, wenn wir drei Pflanzen in unser Büro stellen ?
+
+Wir vergleichen hier die Versuche 1 und 2, wobei der erste Versuch ohne Pflanzen im Büro und der zweite Versuch mit drei verschiedenen Pflanzen durchgeführt wurde. Es handelt sich um eine Zamioculcas zamiifolia, eine Schefflera arboricola und einen Ficus elastica.
+
+```{r}
+#Neues Dataframe um unabhängig zu Arbeiten, entferne nicht benötigte Spalte
+df_frage_3 <- df %>% select(-c("co2_grouped"))
+
+ 
+
+#Datentyp anpassen
+df_frage_3$experiment <- as.factor(df_frage_3$experiment)
+
+ 
+
+#Wichentage aus Datum erzeugen für spätere Visualisierungen
+df_frage_3 <- df_frage_3 %>% mutate(Wochentag=  wday(df_frage_3$date_time, label = TRUE))
+
+ 
+
+
+#Funktion um jeden Wechsel zwischen Fenster offen und geschlossen zu detektieren
+add_window_change_count <- function(data) {
+  data$luefungsnr <- cumsum(c(0, diff(data$mc_distance) != 0))
+  return(data)
+}
+
+ 
+
+df_frage_3 <- add_window_change_count(df_frage_3)
+
+ 
+
+
+```
+
+In einem ersten Versuch haben wir mit einer einfachen Methode die Tagesmittelwerte von CO2 und Feuchte für Tage mit und ohne Pflanzen verglichen. Unser Ziel war es, bereits mit diesen Messungen einen möglichen Unterschied festzustellen und Hinweise auf den Einfluss der Pflanzen zu finden.
+
+```{r}
+ggplot(df_frage_3, aes(x = Wochentag, y = pi_co2, fill = experiment ))+
+  geom_boxplot() + 
+  labs(fill = "Experiment", title = "Tagesverteilung CO2 mit und ohne Pflanze", y= "CO2 in ppm")
+```
+Der Vergleich der CO2-Werte bringt keine Erkenntnisse. Weder der Median der Daten noch die Verteilung scheinen sich signifikant zu ändern, wenn man den ganzen Tag zusammenfasst.
+
+```{r}
+ggplot(df_frage_3, aes(x = Wochentag, y = pi_humidity  , fill = experiment ))+
+  geom_boxplot() + 
+  labs(fill = "Experiment", title = "Tagesverteilung Luftfeuchtigkeit mit und ohne Pflanze", y= "Luftfeuchtigkeit in %")
+```
+Bei der Luftfeuchtigkeit zeigen die Tage Sonntag, Montag und Dienstag eine Tendenz zu höherer Luftfeuchtigkeit, Freitag und Samstag widerlegen diese Behauptung. Man kann aber auch die Verteilung der Luftfeuchtigkeit vergleichen, d.h. die Länge der Boxplots. Aber auch diese sind bei beiden Versuchen vergleichbar. Die beiden Tagesvergleiche lassen keine Rückschlüsse auf den Einfluss der Pflanzen zu.
+
+```{r}
+
+ 
+
+# Bestimmen, wann der Fenster Status auf geschlossen ändert und der Lüftvorgang beendet wird
+schliessungs_index <- which(diff(df$mc_distance) == -1) + 1
+schliessungs_zeitpunkt <- df$date_time[schliessungs_index]
+
+ 
+
+# Neuen Datensatz zur Befüllung initialisieren
+df_closed_30 <- data.frame()
+
+ 
+
+# In einer Schleife die Lüftungsintervalle herausfiltern
+for (i in 1:length(schliessungs_index)) {
+
+  # Zeitpunkt setzen, wann das Fenster geöffnet wurde
+  fenster_schliessungs <- schliessungs_zeitpunkt[i]
+
+  # Zeitintervall setzen abhängig davon wie lange die Lüftung dauert
+  end_zeitpunkt <-  schliessungs_zeitpunkt[i] + 1800
+
+  # Relevante Daten auslesen und modifizieren
+  steigintervall <- df %>%
+    filter(df$date_time >= fenster_schliessungs & df$date_time <= end_zeitpunkt) %>%  # Observationen des Lüftungsintervalls aggregieren
+    group_by(experiment) %>% 
+    mutate(lueftung_id = i) %>%  # Observationen dem Lüftintervall zuordnen
+    mutate(initial_co2_grouped = first(co2_grouped),  # Start ppm-Wert anfügen
+           seconds_past = as.numeric(difftime(date_time, fenster_schliessungs, units = "secs")))  # Sekunden seit Beginn des Lüftungsvorgangs berechnen
+
+  df_closed_30 <- rbind(df_closed_30, steigintervall)  # Intervall zum DataFrame hinzufügen
+}
+#Experiment für Visualiesierung als Faktor wandeln
+df_closed_30$experiment <- as.factor(df_closed_30$experiment)
+
+ 
+
+```
+
+Im zweiten Experiment untersuchen wir den Einfluss der Pflanzen nach dem Lüften. Da wir im Büro jede Stunde lüften, vergleichen wir die Luftfeuchtigkeit und den CO2-Wert nach einer halben Stunde. Die Hypothese ist, dass die Pflanzen den Anstieg des CO2 bremsen und die Luftfeuchtigkeit konstant halten.
+```{r}
+#Messungen die weniger lang als 30Minuten dauern werden sie entfernt
+df_closed_30 %>% group_by(experiment, lueftung_id) %>% filter(!any(mc_distance == TRUE)) %>%  
+  #Visualisierung der Luftfeuchtigkeit nach dem Lüften, pro Experiment
+  ggplot(aes(x = seconds_past, y = pi_humidity, group = lueftung_id, color = experiment))+
+  geom_line(show.legend = FALSE)+
+  facet_wrap(~experiment, labeller = labeller(experiment = c("1" = "Experiment 1", "2" = "Experiment 2")))+
+  labs(title = "Luftfeuchtigkeit nach der Schliessung des Fensters", y = "Luftfeuchtigkeit in %", x = "Vergangene Zeit")
+```
+Bei der Luftfeuchtigkeit ist eine deutliche Veränderung zu erkennen. Im Allgemeinen ist die Luftfeuchtigkeit mit Pflanze ca. 10% höher als im Versuch ohne Pflanzen.
+
+```{r}
+#Messungen die weniger lang als 30Minuten dauern werden sie entfernt
+df_closed_30 %>% group_by(experiment, lueftung_id) %>% filter(!any(mc_distance == TRUE)) %>%  
+  #Boxplot der Luftfeuchtigkeit nach dem Lüften, pro Experiment
+  ggplot(aes(x = seconds_past, y = pi_humidity, fill = experiment))+
+  geom_boxplot(show.legend = FALSE)+
+  facet_wrap(~experiment, labeller = labeller(experiment = c("1" = "Experiment 1", "2" = "Experiment 2")))+
+  labs(title = "Luftfeuchtigkeit nach der Schliessung des Fensters", y = "Luftfeuchtigkeit in %", x = "Vergangene Zeit")
+```
+Wir veranschaulichen diese Visualisierung etwas genauer mit einem Boxplot und sehen, dass die Streuung der Daten in etwa gleich ist. Allerdings ist der Median bei den Pflanzen um ca. 13% höher. Dies deutet auf eine Veränderung bei den Pflanzen hin.
+
+```{r}
+#Messungen die weniger lang als 30Minuten dauern werden sie entfernt
+df_closed_30 %>% group_by(experiment, lueftung_id) %>% 
+  filter(last(pi_co2) > first(pi_co2) & !any(mc_distance == TRUE)) %>% 
+  #Visualisierung des CO2-Wert nach dem Lüften, pro Experiment   
+  ggplot(aes(x = seconds_past, y = pi_co2, group = lueftung_id, color = experiment))+
+  geom_line(show.legend = FALSE)+
+  facet_wrap(~experiment, labeller = labeller(experiment = c("1" = "Experiment 1", "2" = "Experiment 2")))+
+  labs(title = "CO2-Verhalten nach der Schliessung des Fensters", y = "CO2 in ppm", x = "Vergangene Zeit")
+```
+Hingegen bei dem Vergleich der CO2-Werten nach 30 Minuten sind bis auf zwei Ausreisser keine Einfluss der Pflanzen erkennt.
+
+```{r}
+#Messungen die weniger lang als 30Minuten dauern werden sie entfernt
+df_closed_30 %>% group_by(experiment, lueftung_id) %>% filter(last(pi_co2) > first(pi_co2) & !any(mc_distance == TRUE)) %>% #Boxplot des CO2-Wert nach dem Lüften, pro Experiment
+  ggplot(aes(x = seconds_past, y = pi_co2, fill = experiment))+
+  geom_boxplot(show.legend = FALSE)+
+  facet_wrap(~experiment, labeller = labeller(experiment = c("1" = "Experiment 1", "2" = "Experiment 2")))+
+  labs(title = "CO2 nach der Schliessung des Fensters", y = "CO2 in ppm", x = "Vergangene Zeit")
+```
+Diese Aussage wird auch durch die Analyse der Boxplots bestätigt: Die Streuung der Daten und der Median der Daten sind fast identisch.
+
+```{r warning=FALSE}
+#Wochenende-Datensatz erstellt aus den Wochentage Samstag und Sonntag
+df_weekend <- df_frage_3 %>% filter(Wochentag == "Sa" | Wochentag == "So")
+#Vergangene Zeit pro Wochenende als Variable hinzugefügt
+hours_past <- df_weekend %>% group_by(luefungsnr) %>% dplyr::summarise(hours_past = as.numeric(difftime(date_time, first(date_time), units = "hours"))) 
+hours_past <- hours_past$hours_past
+#Vereinenen mit Weekend-Datensatz
+df_weekend <- cbind(df_weekend, hours_past)
+df_weekend$luefungsnr <- as.factor(df_weekend$luefungsnr)
+#Neue Spalte, mit voller Stunde für Spätere Visualisierungen
+df_weekend <- df_weekend %>% mutate(Stunde = hour(date_time))
+```
+
+Da wir bei beiden Vergleichen von der Belüftung und anderen äußeren Einflüssen abhängig waren, haben wir versucht, eine isolierte Umgebung zu schaffen. Als Vergleichszeiträume wurden die Wochenenden gewählt.
+```{r}
+#Visualisierung der Luchtfeuchtigkeit am Wochenende
+df_weekend %>% group_by(experiment) %>% ggplot(aes(x=hours_past, y= pi_humidity, fill = experiment))+
+  geom_boxplot(show.legend = FALSE)+
+  facet_wrap(vars(experiment), labeller = labeller(experiment = c("1" = "Experiment 1", "2" = "Experiment 2")))+
+  labs(title = "Luftfeuchtigkeit verglichen am Wochenende", y = "Luftfeuchtigkeit in %", x = "Vergangene Zeit")
+
+ 
+
+```
+Wir sehen hier deutlich, dass im Pflanzenversuch die Luftfeuchtigkeit eine sehr geringe Streuung aufweist. Wir führen dies darauf zurück, dass die Pflanzen die Luftfeuchte stabil halten.
+```{r}
+#Visualisierung des CO2 am Wochenende
+df_weekend %>% group_by(experiment) %>% 
+  ggplot(aes(x=hours_past, y= pi_co2, fill = experiment))+
+  geom_boxplot(show.legend = FALSE)+
+  facet_wrap(vars(experiment), labeller = labeller(experiment = c("1" = "Experiment 1", "2" = "Experiment 2")))+
+  labs(title = "CO2 vergleich am Wochenende", y = "CO2 in ppm", x = "Vergangene Zeit")
+
+ 
+
+```
+Bei den CO2-Werten hingegen ist kein Einflus spührbar.
+
+In einem Artikel von Gartenjournal.net wurde beschrieben, dass die Zamioculcas zamiifolia (Glücksfeder) auch nachts Sauerstoff produziert. Uns interessierte, ob diese Pflanze auch nachts einen Einfluss hat.
+```{r}
+df_weekend %>% filter(Stunde >= 22 | Stunde <= 7) %>% 
+  ggplot(aes(x = Wochentag, y = pi_co2  , fill = experiment ))+
+  geom_boxplot() + 
+  labs(fill = "Experiment", title = "Tagesverteilung der Luchtfeuchtigkeit verglichen pro Experiment", y= "Luftfeuchtigkeit in %")
+```
+
+
+```{r}
+df_weekend %>% filter(Stunde >= 22 | Stunde <= 7) %>% 
+  ggplot(aes(x = Wochentag, y = pi_humidity  , fill = experiment ))+
+  geom_boxplot() + 
+  labs(fill = "Experiment", title = "Tagesverteilung der Luchtfeuchtigkeit verglichen pro Experiment", y= "Luftfeuchtigkeit in %")
+```
+Leider lässt sich weder bei der Luftfeuchtigkeit noch beim CO2-Wert ein Einfluss feststellen. Die Aussage des Gartenjournals können wir nicht bestätigen.
+
+Grundsätzlich können wir nachweisen, dass wir eine Veränderung der Luftfeuchtigkeit feststellen, sobald wir Messungen mit Pflanzen durchführen. Die Veränderung der CO2-Werte war dagegen sehr gering, was nicht unseren Erwartungen entsprach. Unsere Theorie dazu ist, dass unsere Luftqualität durch das stündliche Lüften zu hoch ist, um eine Veränderung festzustellen.
